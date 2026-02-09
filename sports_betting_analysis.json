@@ -1,0 +1,185 @@
+{
+  "name": "Sports Betting Analysis Tool",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "analyze-games",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [220, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.nba_stats_url || 'https://stats.nba.com/stats/scoreboardv3' }}",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "GameDate", "value": "={{ $now.format('yyyy-MM-dd') }}" },
+            { "name": "LeagueID", "value": "00" }
+          ]
+        },
+        "options": {
+          "response": { "response": { "responseFormat": "json" } }
+        }
+      },
+      "id": "fetch-scoreboard",
+      "name": "Fetch NBA Scoreboard",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [460, 160]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.the-odds-api.com/v4/sports/basketball_nba/odds",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "apiKey", "value": "={{ $env.ODDS_API_KEY }}" },
+            { "name": "regions", "value": "us" },
+            { "name": "markets", "value": "h2h,spreads,totals" },
+            { "name": "oddsFormat", "value": "american" }
+          ]
+        },
+        "options": {
+          "response": { "response": { "responseFormat": "json" } }
+        }
+      },
+      "id": "fetch-odds",
+      "name": "Fetch Live Odds",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [460, 440]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT ar.*, p.pick_type, p.confidence, r.outcome, r.profit_loss FROM analysis_runs ar LEFT JOIN picks p ON p.run_id = ar.id LEFT JOIN results r ON r.pick_id = p.id WHERE ar.run_date > NOW() - INTERVAL '30 days' ORDER BY ar.run_date DESC LIMIT 100"
+      },
+      "id": "fetch-history",
+      "name": "Fetch Historical Data",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.3,
+      "position": [460, 620],
+      "credentials": {
+        "postgres": { "id": "postgres-sports", "name": "Sports Betting DB" }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const scoreboard = $('Fetch NBA Scoreboard').first().json;\nconst odds = $('Fetch Live Odds').all().map(i => i.json);\nconst history = $('Fetch Historical Data').all().map(i => i.json);\n\n// Build game analysis for each matchup\nconst games = Array.isArray(odds) ? odds : [odds];\n\nconst analyses = games.map(game => {\n  const homeTeam = game.home_team;\n  const awayTeam = game.away_team;\n  const commence = game.commence_time;\n\n  // Extract best odds across bookmakers\n  const bookmakers = game.bookmakers || [];\n  let bestSpreadHome = null;\n  let bestSpreadBook = '';\n  let bestTotalOver = null;\n  let bestTotalBook = '';\n  let bestMoneylineHome = null;\n  let bestMlBook = '';\n\n  for (const book of bookmakers) {\n    for (const market of (book.markets || [])) {\n      if (market.key === 'spreads') {\n        const homeOutcome = (market.outcomes || []).find(o => o.name === homeTeam);\n        if (homeOutcome && (!bestSpreadHome || homeOutcome.price > bestSpreadHome.price)) {\n          bestSpreadHome = homeOutcome;\n          bestSpreadBook = book.title;\n        }\n      }\n      if (market.key === 'totals') {\n        const overOutcome = (market.outcomes || []).find(o => o.name === 'Over');\n        if (overOutcome && (!bestTotalOver || overOutcome.price > bestTotalOver.price)) {\n          bestTotalOver = overOutcome;\n          bestTotalBook = book.title;\n        }\n      }\n      if (market.key === 'h2h') {\n        const homeOutcome = (market.outcomes || []).find(o => o.name === homeTeam);\n        if (homeOutcome && (!bestMoneylineHome || homeOutcome.price > bestMoneylineHome.price)) {\n          bestMoneylineHome = homeOutcome;\n          bestMlBook = book.title;\n        }\n      }\n    }\n  }\n\n  // Calculate consensus line from average of all books\n  let spreadSum = 0, spreadCount = 0;\n  let totalSum = 0, totalCount = 0;\n  for (const book of bookmakers) {\n    for (const market of (book.markets || [])) {\n      if (market.key === 'spreads') {\n        const ho = (market.outcomes || []).find(o => o.name === homeTeam);\n        if (ho) { spreadSum += ho.point; spreadCount++; }\n      }\n      if (market.key === 'totals') {\n        const ov = (market.outcomes || []).find(o => o.name === 'Over');\n        if (ov) { totalSum += ov.point; totalCount++; }\n      }\n    }\n  }\n\n  const consensusSpread = spreadCount ? (spreadSum / spreadCount).toFixed(1) : null;\n  const consensusTotal = totalCount ? (totalSum / totalCount).toFixed(1) : null;\n\n  // Check historical model accuracy for these teams\n  const relevantHistory = history.filter(h =>\n    h.home_team === homeTeam || h.away_team === awayTeam ||\n    h.home_team === awayTeam || h.away_team === homeTeam\n  );\n  const pastPicks = relevantHistory.filter(h => h.outcome);\n  const wins = pastPicks.filter(h => h.outcome === 'win').length;\n  const winRate = pastPicks.length ? ((wins / pastPicks.length) * 100).toFixed(1) : 'N/A';\n\n  return {\n    game_id: game.id,\n    home_team: homeTeam,\n    away_team: awayTeam,\n    commence_time: commence,\n    consensus_spread: consensusSpread,\n    consensus_total: consensusTotal,\n    best_spread: bestSpreadHome ? { point: bestSpreadHome.point, price: bestSpreadHome.price, book: bestSpreadBook } : null,\n    best_total_over: bestTotalOver ? { point: bestTotalOver.point, price: bestTotalOver.price, book: bestTotalBook } : null,\n    best_moneyline_home: bestMoneylineHome ? { price: bestMoneylineHome.price, book: bestMlBook } : null,\n    bookmaker_count: bookmakers.length,\n    historical_win_rate: winRate + '%',\n    historical_sample_size: pastPicks.length\n  };\n});\n\nreturn analyses.map(a => ({ json: a }));"
+      },
+      "id": "analyze-matchups",
+      "name": "Analyze Matchups",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [740, 300]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "You are a sports betting analyst. Analyze the following NBA matchup data and provide:\n\n1. **Edge Assessment**: Where the consensus line may be off based on the data\n2. **Best Bets**: Top 1-2 plays with reasoning\n3. **Line Shopping**: Which sportsbook has the best price\n4. **Confidence**: Low / Medium / High\n5. **Key Factors**: Anything notable (rest, injuries, trends)\n\nMatchup data:\n{{ JSON.stringify($json, null, 2) }}\n\nBe concise and data-driven. Focus on actionable insights.",
+        "options": {
+          "maxTokens": 1024,
+          "temperature": 0.3
+        }
+      },
+      "id": "ai-analysis",
+      "name": "AI Edge Analysis",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.6,
+      "position": [1000, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO analysis_runs (game_id, home_team, away_team, analysis, market_spread, market_total) VALUES ('{{ $('Analyze Matchups').item.json.game_id }}', '{{ $('Analyze Matchups').item.json.home_team }}', '{{ $('Analyze Matchups').item.json.away_team }}', '{{ JSON.stringify($json) }}'::jsonb, {{ $('Analyze Matchups').item.json.consensus_spread || 'NULL' }}, {{ $('Analyze Matchups').item.json.consensus_total || 'NULL' }}) RETURNING id"
+      },
+      "id": "store-analysis",
+      "name": "Store Analysis",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.3,
+      "position": [1260, 300],
+      "credentials": {
+        "postgres": { "id": "postgres-sports", "name": "Sports Betting DB" }
+      }
+    },
+    {
+      "parameters": {
+        "values": {
+          "string": [
+            {
+              "name": "status",
+              "value": "success"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "response-node",
+      "name": "Format Response",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.3,
+      "position": [1500, 300]
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [
+          { "node": "Fetch NBA Scoreboard", "type": "main", "index": 0 },
+          { "node": "Fetch Live Odds", "type": "main", "index": 0 },
+          { "node": "Fetch Historical Data", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Fetch NBA Scoreboard": {
+      "main": [
+        [{ "node": "Analyze Matchups", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Live Odds": {
+      "main": [
+        [{ "node": "Analyze Matchups", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Historical Data": {
+      "main": [
+        [{ "node": "Analyze Matchups", "type": "main", "index": 0 }]
+      ]
+    },
+    "Analyze Matchups": {
+      "main": [
+        [{ "node": "AI Edge Analysis", "type": "main", "index": 0 }]
+      ]
+    },
+    "AI Edge Analysis": {
+      "main": [
+        [{ "node": "Store Analysis", "type": "main", "index": 0 }]
+      ]
+    },
+    "Store Analysis": {
+      "main": [
+        [{ "node": "Format Response", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "instanceId": "sports-betting-analysis-v1"
+  },
+  "tags": [
+    { "name": "sports-betting" },
+    { "name": "nba" },
+    { "name": "analysis" }
+  ]
+}
